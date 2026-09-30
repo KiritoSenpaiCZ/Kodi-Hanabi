@@ -5,13 +5,13 @@ Kodi subtitle service addon for hanabi.fan — Czech anime subtitles, via Hanabi
 Compatible with Kodi 19, 20, and 21.
 
 ## Current Version
-service.subtitles.hanabi - 1.0.1
+service.subtitles.hanabi - 1.1.0
 
 ## Installation Instructions
 Recommended: install through the [Highflight Subtitles Repository](https://github.com/KiritoSenpaiCZ/KiritoSenpaiCZ.github.io), which also handles updates.
 
 Manual install:
-1. Download `service.subtitles.hanabi-1.0.1.zip` from this repo (or build it from source)
+1. Download `service.subtitles.hanabi-1.1.0.zip` from this repo (or build it from source)
 2. In Kodi: **Add-ons > Install from zip file**, select the zip
 
 ## Setup Instructions
