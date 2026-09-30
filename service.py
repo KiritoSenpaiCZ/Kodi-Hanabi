@@ -19,10 +19,12 @@ including the download - never as a URL parameter, never logged.
 Endpoints used (see the site's own API.md for the authoritative spec):
   - GET /projects?query=<text>            - search projects by title
                                              (matches original/English
-                                             title too)
+                                             title too); paginated via
+                                             `page`/`total_pages`
   - GET /projects/{id}/subtitles?episode=N - subtitle releases for one
                                              episode of a project (omit
-                                             `episode` for the full list)
+                                             `episode` for the full list);
+                                             also paginated
   - GET /subtitles/{id}/download           - the actual file, as a ZIP
                                              (Content-Type: application/zip,
                                              not password-protected)
@@ -31,11 +33,30 @@ A project can have more than one subtitle release per episode (different
 fansub release groups, or different translation versions) - all of them
 are listed rather than picked automatically, the same way WoSir lists
 separate TV/BD releases, since only the person watching knows which
-release their video file actually is.
+release their video file actually is. Likewise, since Hanabi's project
+data carries no season field, a search can legitimately match more than
+one project (e.g. a combined project vs. a separate "2nd Season" one) -
+see pick_candidate_projects() below, which surfaces every plausible match
+instead of silently guessing.
 
-Per the API doc: the ZIP download can take up to ~30s to build
-server-side, so that request uses a longer timeout than the other calls;
-a ZIP is capped at 50MB by the API itself.
+Per the API doc: a download doesn't get built on request - the API loads
+an already-existing ZIP from its own storage and passes it straight
+through. The often-quoted "~30 seconds" is the API's own worst-case
+timeout for that storage read, not the typical download time; in normal
+operation the server responds immediately and the ZIP downloads at once.
+This addon's own DOWNLOAD_TIMEOUT is set to roughly the same order of
+magnitude as that server-side ceiling, purely so an unusually slow
+storage read isn't cut off client-side. A ZIP is capped at 50MB by the
+API itself, which is also why downloads here are streamed with their own
+size cap rather than trusted blindly (see MAX_DOWNLOAD_BYTES below).
+
+The account (not just this addon) is rate-limited by Hanabi: 60
+requests/minute shared across token verification and the search/listing
+endpoints, and separately 10 ZIP downloads/minute (60/hour, at most 2
+concurrent downloads) - added by the API's own maintainer to keep the
+server from being overloaded. A 429 response carries a `Retry-After`
+header (seconds to wait); see http_get_with_retry() below for how this
+addon handles it.
 
 Design choices carried over on purpose from Hiyori/WoSir/Edna/Kamui:
   - No session/result caching beyond the short-lived per-search rows
@@ -47,9 +68,11 @@ Design choices carried over on purpose from Hiyori/WoSir/Edna/Kamui:
 """
 
 import difflib
+import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -77,10 +100,32 @@ HANDLE = int(sys.argv[1])
 
 API_BASE = "https://hanabi.fan/wp-json/hanabi/v1"
 REQUEST_TIMEOUT = 15
-DOWNLOAD_TIMEOUT = 40  # API doc: building the ZIP server-side can take ~30s
+DOWNLOAD_TIMEOUT = 40  # API doc: reading the ZIP from storage server-side can take up to ~30s in the worst case
 
 LANG_NAME = "Czech"
 LANG_FLAG = "cs"
+
+# Hanabi's documented account-wide rate limit is 60 req/min for
+# search/listing endpoints; a wait longer than this is reported to the
+# user instead of blocking Kodi's UI thread for a long time.
+MAX_RATE_LIMIT_WAIT = 60
+
+# The API itself caps a ZIP at 50MB - refuse anything meaningfully bigger
+# rather than trust a Content-Length header or stream indefinitely.
+MAX_DOWNLOAD_BYTES = 55 * 1024 * 1024
+
+# Zip-bomb guard: refuse to extract an archive whose *uncompressed*
+# contents would be implausibly large for a subtitle file/pack.
+MAX_EXTRACTED_BYTES = 200 * 1024 * 1024
+
+# Safety cap on how many subtitle rows get listed in one go, in case a
+# search matches several ambiguous projects that each have many releases.
+MAX_DISPLAY_ITEMS = 80
+
+# Anything left behind in TEMP_DIR older than this gets swept on the next
+# run - a search+download round trip finishes in well under a minute, so
+# anything still there an hour later is leftover, not in-use.
+TEMP_MAX_AGE_SECONDS = 3600
 
 
 # ---------------- small helpers ----------------
@@ -112,6 +157,34 @@ def load_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def cleanup_temp_dir():
+    """Sweep old downloaded zips, extracted-subtitle folders, and the rows
+    cache out of TEMP_DIR. Nothing ever deleted these before, so they
+    accumulated forever; anything older than TEMP_MAX_AGE_SECONDS is safe
+    to remove."""
+    try:
+        now = time.time()
+        for name in os.listdir(TEMP_DIR):
+            if not name.startswith('hanabi_'):
+                continue
+            path = os.path.join(TEMP_DIR, name)
+            try:
+                age = now - os.path.getmtime(path)
+            except OSError:
+                continue
+            if age < TEMP_MAX_AGE_SECONDS:
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except OSError as e:
+                log("cleanup: couldn't remove {0}: {1}".format(path, e))
+    except Exception as e:
+        log("cleanup_temp_dir failed: {0}".format(e))
 
 
 def auth_headers():
@@ -181,17 +254,24 @@ def extract_season_episode(text):
     return cleaned, season, episode
 
 
-def pick_best_project(query, projects):
-    """Case-insensitive closest-title match, tried against each of the
-    title/original_title/english_title fields the API returns (a query
-    can match any of the three server-side) - picks whichever project has
-    the single closest match across all three."""
+def pick_candidate_projects(query, projects, max_candidates=5):
+    """Score every project against the query (same closest-title logic the
+    old pick_best_project() used, tried against title/original_title/
+    english_title) and return every plausible candidate rather than
+    silently picking one. Hanabi's project data has no season field, so a
+    query like "Some Anime 2" can legitimately match both a combined
+    project and a separate "2nd Season" project - in that case the user
+    should choose, not the addon.
+
+    Returns a list of projects, most-likely first. A single clear winner
+    (a high ratio, comfortably ahead of the runner-up) still comes back as
+    a one-item list, so callers only need one code path."""
     if not projects:
-        return None
+        return []
     query_lower = query.lower()
-    best = None
-    best_ratio = -1.0
+    scored = []
     for p in projects:
+        best_ratio = -1.0
         for field in ('title', 'original_title', 'english_title'):
             candidate = (p.get(field) or '').strip()
             if not candidate:
@@ -199,8 +279,16 @@ def pick_best_project(query, projects):
             ratio = difflib.SequenceMatcher(None, query_lower, candidate.lower()).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
-                best = p
-    return best or projects[0]
+        scored.append((best_ratio, p))
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    top_ratio = scored[0][0]
+    second_ratio = scored[1][0] if len(scored) > 1 else -1.0
+    if top_ratio >= 0.92 and (top_ratio - second_ratio) >= 0.12:
+        return [scored[0][1]]
+
+    candidates = [p for ratio, p in scored if ratio >= 0.35][:max_candidates]
+    return candidates or [scored[0][1]]
 
 
 def get_allowed_languages(params):
@@ -212,11 +300,47 @@ def get_allowed_languages(params):
 
 # ---------------- API access ----------------
 
+def _parse_retry_after(value):
+    """Parse a Retry-After header value. Hanabi's docs describe it purely
+    as a number of seconds (e.g. `Retry-After: 45`), not an HTTP-date, so
+    that's all this handles; returns None if it can't be parsed."""
+    if not value:
+        return None
+    try:
+        seconds = int(str(value).strip())
+        return seconds if seconds >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def http_get_with_retry(url, headers=None, params=None, timeout=REQUEST_TIMEOUT, _retried=False, **kwargs):
+    """requests.get() wrapper that understands Hanabi's account-wide rate
+    limiting. On HTTP 429 it reads the `Retry-After` header (seconds),
+    tells the user how long that is, waits, and retries exactly once - a
+    short wait is worth absorbing automatically, but a long one is
+    reported instead of blocking Kodi's UI thread. Accepts the same
+    keyword arguments as requests.get (e.g. stream=True for downloads)."""
+    resp = requests.get(url, headers=headers, params=params, timeout=timeout, **kwargs)
+    if resp.status_code == 429 and not _retried:
+        wait_s = _parse_retry_after(resp.headers.get('Retry-After'))
+        if wait_s is None:
+            wait_s = 5
+        if wait_s <= MAX_RATE_LIMIT_WAIT:
+            notify("Hanabi rate limit hit - waiting {0}s...".format(wait_s))
+            log("HTTP 429 from {0}, waiting {1}s per Retry-After then retrying once".format(url, wait_s))
+            xbmc.sleep(wait_s * 1000)
+            return http_get_with_retry(url, headers=headers, params=params, timeout=timeout, _retried=True, **kwargs)
+        minutes = max(1, wait_s // 60)
+        notify("Hanabi rate limit hit - try again in about {0} minute(s).".format(minutes))
+        log("HTTP 429 from {0}, Retry-After={1}s exceeds MAX_RATE_LIMIT_WAIT, not retrying".format(url, wait_s))
+    return resp
+
+
 def api_get(path, params=None):
     """GET against the Hanabi API. Returns (ok, data_or_error_message)."""
     url = API_BASE + path
     try:
-        resp = requests.get(url, headers=auth_headers(), params=params, timeout=REQUEST_TIMEOUT)
+        resp = http_get_with_retry(url, headers=auth_headers(), params=params, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         log("request to {0} failed: {1}".format(path, e))
         return False, "Network error contacting Hanabi (see debug log)."
@@ -230,38 +354,69 @@ def api_get(path, params=None):
 
     msg = api_error_message(resp)
     log("{0} -> HTTP {1}: {2}".format(path, resp.status_code, msg))
+    if resp.status_code == 429:
+        return False, "Hanabi rate limit hit - please wait a bit and try again."
     if resp.status_code == 401:
         return False, "Hanabi token missing/invalid or account not approved - check the addon settings."
     return False, msg
 
 
+def api_get_all_pages(path, params=None, item_key='items', max_pages=10, max_items=None):
+    """GET every page of a paginated Hanabi listing endpoint, following the
+    API's own `page`/`total_pages` response fields, instead of only ever
+    reading the first page. `max_pages`/`max_items` are safety caps
+    against a runaway loop (an API bug, or an unexpectedly huge result),
+    not limits expected to bite in normal use. If a later page fails, the
+    items already collected are returned rather than thrown away."""
+    all_items = []
+    page = 1
+    params = dict(params or {})
+    per_page = params.get('per_page')
+    while True:
+        page_params = dict(params)
+        page_params['page'] = page
+        ok, data = api_get(path, page_params)
+        if not ok:
+            if all_items:
+                log("pagination for {0} stopped early on page {1}: {2}".format(path, page, data))
+                break
+            notify(data)
+            return []
+
+        items = data.get(item_key) or [] if isinstance(data, dict) else []
+        all_items.extend(items)
+
+        if max_items is not None and len(all_items) >= max_items:
+            all_items = all_items[:max_items]
+            break
+        if not items:
+            break
+
+        total_pages = data.get('total_pages') if isinstance(data, dict) else None
+        if total_pages is not None:
+            if page >= total_pages:
+                break
+        elif per_page is not None and len(items) < per_page:
+            # No total_pages field to go by - a short page means it's the last one.
+            break
+
+        page += 1
+        if page > max_pages:
+            log("pagination for {0} hit max_pages={1}, stopping".format(path, max_pages))
+            break
+
+    return all_items
+
+
 def search_projects(query):
-    ok, data = api_get("/projects", {"query": query, "per_page": 20})
-    if not ok:
-        notify(data)
-        return []
-    return data.get('items', [])
+    return api_get_all_pages("/projects", {"query": query, "per_page": 20}, max_pages=5, max_items=100)
 
 
 def fetch_subtitles(project_id, episode=None):
     params = {"per_page": 50}
     if episode is not None:
         params["episode"] = episode
-    ok, data = api_get("/projects/{0}/subtitles".format(project_id), params)
-    if not ok:
-        notify(data)
-        return []
-    return data.get('items', [])
-
-
-def guess_extension(body_sample):
-    try:
-        sample_text = body_sample.decode('utf-8', 'ignore')
-    except Exception:
-        sample_text = ""
-    if sample_text.strip().startswith("[Script Info]"):
-        return ".ass"
-    return ".srt"
+    return api_get_all_pages("/projects/{0}/subtitles".format(project_id), params, max_pages=6, max_items=300)
 
 
 # ---------------- Kodi-facing actions ----------------
@@ -324,47 +479,58 @@ def handle_search(params, is_manual):
     log("query='{0}' season={1} episode={2} manual={3}".format(query, season, episode, is_manual))
     # Hanabi's own project data has no season field (always null per the
     # API doc) - a numbered season, if any, is part of the project's own
-    # title (e.g. a "2nd Season" project), which pick_best_project() can
-    # only match if the cleaned query happens to overlap with it. Not
-    # perfect, flagged here rather than silently assumed correct.
+    # title (e.g. a "2nd Season" project). pick_candidate_projects() below
+    # surfaces every plausible match instead of silently guessing one.
 
     projects = search_projects(query)
     log("{0} project(s) matched '{1}'".format(len(projects), query))
     if not projects:
         return
 
-    project = pick_best_project(query, projects)
-    log("picked project: '{0}' (id={1})".format(project.get('title'), project.get('id')))
-
-    rows = fetch_subtitles(project['id'], episode=episode)
-    log("{0} subtitle release(s) found".format(len(rows)))
-    if not rows:
-        return
+    candidates = pick_candidate_projects(query, projects)
+    multi = len(candidates) > 1
+    if multi:
+        log("{0} ambiguous project candidate(s) for '{1}': {2}".format(
+            len(candidates), query, [c.get('title') for c in candidates]))
+else:
+        log("picked project: '{0}' (id={1})".format(candidates[0].get('title'), candidates[0].get('id')))
 
     allowed_langs = get_allowed_languages(params)
     saved = {}
     shown = 0
-    for i, row in enumerate(rows):
-        lang_name = LANG_NAME if row.get('language') == 'cs' else (row.get('language') or LANG_NAME)
-        if allowed_langs and lang_name not in allowed_langs:
-            continue
-        rid = str(i)
-        saved[rid] = row
-        ep = row.get('episode')
-        ep_label = "E{0}".format(ep) if ep is not None else "(pack)"
-        version = row.get('version')
-        note = row.get('note')
-        label2 = "{0} - {1}{2}{3}".format(
-            ep_label,
-            row.get('release') or '?',
-            " v{0}".format(version) if version else "",
-            " ({0})".format(note) if note else "",
-        )
-        append_subtitle(lang_name, LANG_FLAG if lang_name == LANG_NAME else '', label2, {"action": "download", "rid": rid})
-        shown += 1
+    for project in candidates:
+        if shown >= MAX_DISPLAY_ITEMS:
+            break
+        rows = fetch_subtitles(project['id'], episode=episode)
+        log("{0} subtitle release(s) found for '{1}'".format(len(rows), project.get('title')))
+        for row in rows:
+            if shown >= MAX_DISPLAY_ITEMS:
+                log("hit MAX_DISPLAY_ITEMS={0}, not listing any more".format(MAX_DISPLAY_ITEMS))
+                break
+            lang_name = LANG_NAME if row.get('language') == 'cs' else (row.get('language') or LANG_NAME)
+            if allowed_langs and lang_name not in allowed_langs:
+                continue
+            rid = str(len(saved))
+            saved[rid] = row
+            ep = row.get('episode')
+            ep_label = "E{0}".format(ep) if ep is not None else "(pack)"
+            version = row.get('version')
+            note = row.get('note')
+            label2 = "{0} - {1}{2}{3}".format(
+                ep_label,
+                row.get('release') or '?',
+                " v{0}".format(version) if version else "",
+                " ({0})".format(note) if note else "",
+            )
+            if multi:
+                # More than one project matched ambiguously - prefix with
+                # the project title so the user can tell them apart.
+                label2 = "{0}: {1}".format(project.get('title') or '?', label2)
+            append_subtitle(lang_name, LANG_FLAG if lang_name == LANG_NAME else '', label2, {"action": "download", "rid": rid})
+            shown += 1
 
     save_json(ROWS_FILE, saved)
-    log("listed {0} subtitle(s) for '{1}'".format(shown, project.get('title')))
+    log("listed {0} subtitle(s) for '{1}'".format(shown, query))
 
 
 def handle_download(params):
@@ -385,78 +551,118 @@ def handle_download(params):
         return
 
     try:
-        resp = requests.get(download_url, headers=auth_headers(), timeout=DOWNLOAD_TIMEOUT)
+        resp = http_get_with_retry(download_url, headers=auth_headers(), timeout=DOWNLOAD_TIMEOUT, stream=True)
     except Exception as e:
         log("download failed: {0}".format(e))
         notify("Download failed (see debug log).")
         return
 
-    if resp.status_code != 200:
-        notify("Download failed: {0}".format(api_error_message(resp)))
-        log("download got HTTP {0}".format(resp.status_code))
-        return
+    try:
+        if resp.status_code != 200:
+            notify("Download failed: {0}".format(api_error_message(resp)))
+            log("download got HTTP {0}".format(resp.status_code))
+            return
 
-    content = resp.content
+        content_length = resp.headers.get('Content-Length')
+        if content_length:
+            try:
+                if int(content_length) > MAX_DOWNLOAD_BYTES:
+                    notify("Download refused - file is larger than expected (see debug log).")
+                    log("download refused: Content-Length {0} exceeds MAX_DOWNLOAD_BYTES {1}".format(
+                        content_length, MAX_DOWNLOAD_BYTES))
+                    return
+            except ValueError:
+                pass
+
+        # Stream and enforce the size cap as we go, rather than trusting
+        # Content-Length alone (it can be absent or wrong) or buffering an
+        # unbounded response straight into memory.
+        buf = io.BytesIO()
+        total = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    notify("Download aborted - file is larger than expected (see debug log).")
+                    log("download aborted after {0} bytes, exceeds MAX_DOWNLOAD_BYTES {1}".format(
+                        total, MAX_DOWNLOAD_BYTES))
+                    return
+                buf.write(chunk)
+except Exception as e:
+            log("download stream failed: {0}".format(e))
+            notify("Download failed (see debug log).")
+            return
+finally:
+        resp.close()
+
+    content = buf.getvalue()
     if not content:
         notify("Download failed - empty response (see debug log).")
         return
 
+    # The API always returns a ZIP (Content-Type: application/zip) - a
+    # non-ZIP body (an HTML error page, a proxy's own error page, ...) is
+    # rejected outright now rather than guessed-at and saved as a .srt,
+    # which could silently hand Kodi garbage as a "subtitle".
+    if not zipfile.is_zipfile(io.BytesIO(content)):
+        notify("Download failed - response wasn't a valid subtitle archive (see debug log).")
+        log("downloaded body isn't a valid zip (first bytes: {0!r})".format(content[:16]))
+        return
+
     safe_name = re.sub(r'[^\w\-]+', '_', str(row.get('id', 'sub')))
-    is_zip = content[:2] == b'PK'
+    zip_path = os.path.join(TEMP_DIR, "hanabi_{0}_{1}.zip".format(safe_name, int(time.time())))
+    try:
+        with open(zip_path, 'wb') as f:
+            f.write(content)
+except Exception as e:
+        log("failed to write zip file: {0}".format(e))
+        notify("Downloaded but couldn't save the file (see debug log).")
+        return
 
-    if is_zip:
-        zip_path = os.path.join(TEMP_DIR, "hanabi_{0}_{1}.zip".format(safe_name, int(time.time())))
-        try:
-            with open(zip_path, 'wb') as f:
-                f.write(content)
-        except Exception as e:
-            log("failed to write zip file: {0}".format(e))
-            notify("Downloaded but couldn't save the file (see debug log).")
-            return
+    extract_dir = os.path.join(TEMP_DIR, "hanabi_{0}_{1}".format(safe_name, int(time.time())))
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            # Zip-bomb guard: check the *uncompressed* total before
+            # extracting, not just the compressed download size.
+            extracted_size = sum(info.file_size for info in zf.infolist())
+            if extracted_size > MAX_EXTRACTED_BYTES:
+                notify("Download refused - archive is larger than expected when extracted (see debug log).")
+                log("refusing to extract {0}: extracted size {1} exceeds MAX_EXTRACTED_BYTES {2}".format(
+                    zip_path, extracted_size, MAX_EXTRACTED_BYTES))
+                return
+            zf.extractall(extract_dir)
+except zipfile.BadZipFile as e:
+        log("zip file is corrupt: {0}".format(e))
+        notify("Downloaded file wasn't a valid archive (see debug log).")
+        return
+except Exception as e:
+        log("zip extract failed: {0}".format(e))
+        notify("Downloaded a zip but couldn't extract it (see debug log).")
+        return
 
-        extract_dir = os.path.join(TEMP_DIR, "hanabi_{0}_{1}".format(safe_name, int(time.time())))
-        try:
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(extract_dir)
-        except Exception as e:
-            log("zip extract failed: {0}".format(e))
-            notify("Downloaded a zip but couldn't extract it (see debug log).")
-            return
-
-        sub_file = None
-        for root, _dirs, files in os.walk(extract_dir):
-            for fn in files:
-                if fn.lower().endswith(('.srt', '.ass', '.sub')):
-                    sub_file = os.path.join(root, fn)
-                    break
-            if sub_file:
+    sub_file = None
+    for root, _dirs, files in os.walk(extract_dir):
+        for fn in files:
+            if fn.lower().endswith(('.srt', '.ass', '.sub')):
+                sub_file = os.path.join(root, fn)
                 break
-        if not sub_file:
-            notify("Downloaded and extracted, but no .srt/.ass file found inside.")
-            log("no subtitle file found after extracting {0}".format(zip_path))
-            return
-        filepath = sub_file
-    else:
-        # Not expected per the API doc (always application/zip), but
-        # handled defensively the same way as every other addon here.
-        ext = guess_extension(content[:200])
-        filename = "hanabi_{0}_{1}{2}".format(safe_name, int(time.time()), ext)
-        filepath = os.path.join(TEMP_DIR, filename)
-        try:
-            with open(filepath, 'wb') as f:
-                f.write(content)
-        except Exception as e:
-            log("failed to write subtitle file: {0}".format(e))
-            notify("Downloaded but couldn't save the file (see debug log).")
-            return
+        if sub_file:
+            break
+    if not sub_file:
+        notify("Downloaded and extracted, but no .srt/.ass file found inside.")
+        log("no subtitle file found after extracting {0}".format(zip_path))
+        return
 
-    log("saved subtitle to {0}".format(filepath))
-    listitem = xbmcgui.ListItem(label=os.path.basename(filepath))
-    xbmcplugin.addDirectoryItem(handle=HANDLE, url=filepath, listitem=listitem, isFolder=False)
+    log("saved subtitle to {0}".format(sub_file))
+    listitem = xbmcgui.ListItem(label=os.path.basename(sub_file))
+    xbmcplugin.addDirectoryItem(handle=HANDLE, url=sub_file, listitem=listitem, isFolder=False)
 
 
 def run():
     try:
+        cleanup_temp_dir()
         params = get_params()
         action = params.get('action', [''])[0]
         log("action={0} params={1}".format(action, params))
