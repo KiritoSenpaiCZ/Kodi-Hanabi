@@ -492,7 +492,7 @@ def handle_search(params, is_manual):
     if multi:
         log("{0} ambiguous project candidate(s) for '{1}': {2}".format(
             len(candidates), query, [c.get('title') for c in candidates]))
-else:
+    else:
         log("picked project: '{0}' (id={1})".format(candidates[0].get('title'), candidates[0].get('id')))
 
     allowed_langs = get_allowed_languages(params)
@@ -590,11 +590,11 @@ def handle_download(params):
                         total, MAX_DOWNLOAD_BYTES))
                     return
                 buf.write(chunk)
-except Exception as e:
+        except Exception as e:
             log("download stream failed: {0}".format(e))
             notify("Download failed (see debug log).")
             return
-finally:
+    finally:
         resp.close()
 
     content = buf.getvalue()
@@ -616,7 +616,7 @@ finally:
     try:
         with open(zip_path, 'wb') as f:
             f.write(content)
-except Exception as e:
+    except Exception as e:
         log("failed to write zip file: {0}".format(e))
         notify("Downloaded but couldn't save the file (see debug log).")
         return
@@ -633,11 +633,11 @@ except Exception as e:
                     zip_path, extracted_size, MAX_EXTRACTED_BYTES))
                 return
             zf.extractall(extract_dir)
-except zipfile.BadZipFile as e:
+    except zipfile.BadZipFile as e:
         log("zip file is corrupt: {0}".format(e))
         notify("Downloaded file wasn't a valid archive (see debug log).")
         return
-except Exception as e:
+    except Exception as e:
         log("zip extract failed: {0}".format(e))
         notify("Downloaded a zip but couldn't extract it (see debug log).")
         return
