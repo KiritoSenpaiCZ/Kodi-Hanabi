@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="service.subtitles.hanabi" name="Hanabi Subtitles" version="1.0.0" provider-name="Highflight Studio">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+        <import addon="script.module.requests" version="2.22.0"/>
+    </requires>
+    <extension point="xbmc.subtitle.module" library="service.py"/>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">Hanabi.fan subtitles for anime, via Hanabi's own official API</summary>
+        <description lang="en_GB">Searches and downloads Czech anime subtitles from Hanabi (hanabi.fan) using Hanabi's own official REST API (not site scraping). Requires a personal access token - create one at hanabi.fan under your account settings' "Přístupový token" tab, then paste it into this addon's settings.</description>
+        <disclaimer lang="en_GB">Requires a Hanabi.fan account and a personal access token, entered in this addon's settings.</disclaimer>
+        <platform>all</platform>
+        <license>All Rights Reserved</license>
+        <assets>
+            <icon>icon.png</icon>
+        </assets>
+    </extension>
+</addon>
