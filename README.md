@@ -5,13 +5,13 @@ Kodi subtitle service addon for hanabi.fan — Czech anime subtitles, via Hanabi
 Compatible with Kodi 19, 20, and 21.
 
 ## Current Version
-service.subtitles.hanabi - 1.1.2
+service.subtitles.hanabi - 1.2.0
 
 ## Installation Instructions
 Recommended: install through the [Highflight Subtitles Repository](https://github.com/KiritoSenpaiCZ/KiritoSenpaiCZ.github.io), which also handles updates.
 
 Manual install:
-1. Download `service.subtitles.hanabi-1.1.2.zip` from this repo (or build it from source)
+1. Download `service.subtitles.hanabi-1.2.0.zip` from this repo (or build it from source)
 2. In Kodi: **Add-ons > Install from zip file**, select the zip
 
 ## Setup Instructions
@@ -21,6 +21,7 @@ Manual install:
 The token is only ever sent as an `Authorization: Bearer` header — never in a URL or written to the debug log.
 
 ## How it works
+- Messages and settings are in Czech when Kodi is set to Czech or Slovak, and in English otherwise
 - Matches Kodi's video metadata (or a manual search) against Hanabi's project catalog
 - Lists every available subtitle release for the matching episode, since different fansub groups/versions show up separately
 - Downloads and extracts the matching release's zip automatically

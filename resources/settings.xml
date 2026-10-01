@@ -1,3 +1,3 @@
 <settings>
-    <setting id="token" type="text" label="Hanabi.fan access token" option="hidden" default=""/>
+    <setting id="token" type="text" label="32001" option="hidden" default=""/>
 </settings>

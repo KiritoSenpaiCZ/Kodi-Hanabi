@@ -115,6 +115,22 @@ TEMP_FILE_PREFIX = 'hanabi_'
 KEEP_FILES = {os.path.basename(ROWS_FILE), os.path.basename(OWNERS_FILE)}
 
 
+# >>> shared block "kodi_lang" - edit dev/shared/kodi_lang.py in KiritoSenpaiCZ.github.io, then run dev/sync.py
+# The addon's messages are in Czech when Kodi's language is Czech or Slovak,
+# English otherwise. L("english", "czech", *args) picks one and fills in
+# {0}-style placeholders like str.format.
+try:
+    _UI_LANG = xbmc.getLanguage(xbmc.ISO_639_1)
+except Exception:
+    _UI_LANG = ''
+
+
+def L(en, cs, *args):
+    text = cs if _UI_LANG in ('cs', 'sk') else en
+    return text.format(*args) if args else text
+# <<< shared block "kodi_lang"
+
+
 # ---------------- small helpers ----------------
 
 def log(msg):
@@ -369,12 +385,12 @@ def http_get_with_retry(url, headers=None, params=None, timeout=REQUEST_TIMEOUT,
         if wait_s is None:
             wait_s = 5
         if wait_s <= MAX_RATE_LIMIT_WAIT:
-            notify("Hanabi rate limit hit - waiting {0}s...".format(wait_s))
+            notify(L('Hanabi rate limit hit - waiting {0}s...', 'Dosažen limit požadavků Hanabi - čekám {0} s...', wait_s))
             log("HTTP 429 from {0}, waiting {1}s per Retry-After then retrying once".format(url, wait_s))
             xbmc.sleep(wait_s * 1000)
             return http_get_with_retry(url, headers=headers, params=params, timeout=timeout, _retried=True, **kwargs)
         minutes = max(1, wait_s // 60)
-        notify("Hanabi rate limit hit - try again in about {0} minute(s).".format(minutes))
+        notify(L('Hanabi rate limit hit - try again in about {0} minute(s).', 'Dosažen limit požadavků Hanabi - zkuste to znovu asi za {0} min.', minutes))
         log("HTTP 429 from {0}, Retry-After={1}s exceeds MAX_RATE_LIMIT_WAIT, not retrying".format(url, wait_s))
     return resp
 
@@ -386,21 +402,21 @@ def api_get(path, params=None):
         resp = http_get_with_retry(url, headers=auth_headers(), params=params, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         log("request to {0} failed: {1}".format(path, e))
-        return False, "Network error contacting Hanabi (see debug log)."
+        return False, L("Network error contacting Hanabi (see debug log).", "Chyba sítě při spojení s Hanabi (podrobnosti v logu).")
 
     if resp.status_code == 200:
         try:
             return True, resp.json()
         except Exception as e:
             log("could not parse JSON from {0}: {1}".format(path, e))
-            return False, "Unexpected response from Hanabi (see debug log)."
+            return False, L("Unexpected response from Hanabi (see debug log).", "Neočekávaná odpověď od Hanabi (podrobnosti v logu).")
 
     msg = api_error_message(resp)
     log("{0} -> HTTP {1}: {2}".format(path, resp.status_code, msg))
     if resp.status_code == 429:
-        return False, "Hanabi rate limit hit - please wait a bit and try again."
+        return False, L("Hanabi rate limit hit - please wait a bit and try again.", "Dosažen limit požadavků Hanabi - chvíli počkejte a zkuste to znovu.")
     if resp.status_code == 401:
-        return False, "Hanabi token missing/invalid or account not approved - check the addon settings."
+        return False, L("Hanabi token missing/invalid or account not approved - check the addon settings.", "Token k Hanabi chybí nebo je neplatný, případně účet není schválený - zkontrolujte nastavení doplňku.")
     return False, msg
 
 
@@ -480,7 +496,7 @@ def append_subtitle(lang_name, flag_code, label2, url_params):
 def handle_search(params, is_manual):
     token = ADDON.getSetting('token').strip()
     if not token:
-        notify("Set your Hanabi access token in the addon settings.")
+        notify(L('Set your Hanabi access token in the addon settings.', 'Nastavte svůj přístupový token k Hanabi v nastavení doplňku.'))
         ADDON.openSettings()
         return
 
@@ -556,7 +572,7 @@ def handle_search(params, is_manual):
             rid = str(len(saved))
             saved[rid] = row
             ep = row.get('episode')
-            ep_label = "E{0}".format(ep) if ep is not None else "(pack)"
+            ep_label = "E{0}".format(ep) if ep is not None else L("(pack)", "(balík)")
             version = row.get('version')
             note = row.get('note')
             label2 = "{0} - {1}{2}{3}".format(
@@ -579,17 +595,17 @@ def handle_search(params, is_manual):
 def handle_download(params):
     rid = params.get('rid', [None])[0]
     if rid is None:
-        notify("Nothing to download.")
+        notify(L('Nothing to download.', 'Není co stáhnout.'))
         return
     rows = load_json(ROWS_FILE) or {}
     row = rows.get(rid)
     if not row:
-        notify("Subtitle info expired - please search again.")
+        notify(L('Subtitle info expired - please search again.', 'Údaje o titulcích vypršely - vyhledejte prosím znovu.'))
         return
 
     download_url = row.get('download_url')
     if not download_url:
-        notify("No download link for this subtitle (see debug log).")
+        notify(L('No download link for this subtitle (see debug log).', 'Tyto titulky nemají odkaz ke stažení (podrobnosti v logu).'))
         log("row has no download_url: {0}".format({k: v for k, v in row.items() if k != 'download_url'}))
         return
 
@@ -597,12 +613,12 @@ def handle_download(params):
         resp = http_get_with_retry(download_url, headers=auth_headers(), timeout=DOWNLOAD_TIMEOUT, stream=True)
     except Exception as e:
         log("download failed: {0}".format(e))
-        notify("Download failed (see debug log).")
+        notify(L('Download failed (see debug log).', 'Stažení selhalo (podrobnosti v logu).'))
         return
 
     try:
         if resp.status_code != 200:
-            notify("Download failed: {0}".format(api_error_message(resp)))
+            notify(L('Download failed: {0}', 'Stažení selhalo: {0}', api_error_message(resp)))
             log("download got HTTP {0}".format(resp.status_code))
             return
 
@@ -610,7 +626,7 @@ def handle_download(params):
         if content_length:
             try:
                 if int(content_length) > MAX_DOWNLOAD_BYTES:
-                    notify("Download refused - file is larger than expected (see debug log).")
+                    notify(L('Download refused - file is larger than expected (see debug log).', 'Stažení odmítnuto - soubor je větší, než by měl být (podrobnosti v logu).'))
                     log("download refused: Content-Length {0} exceeds MAX_DOWNLOAD_BYTES {1}".format(
                         content_length, MAX_DOWNLOAD_BYTES))
                     return
@@ -628,21 +644,21 @@ def handle_download(params):
                     continue
                 total += len(chunk)
                 if total > MAX_DOWNLOAD_BYTES:
-                    notify("Download aborted - file is larger than expected (see debug log).")
+                    notify(L('Download aborted - file is larger than expected (see debug log).', 'Stahování přerušeno - soubor je větší, než by měl být (podrobnosti v logu).'))
                     log("download aborted after {0} bytes, exceeds MAX_DOWNLOAD_BYTES {1}".format(
                         total, MAX_DOWNLOAD_BYTES))
                     return
                 buf.write(chunk)
         except Exception as e:
             log("download stream failed: {0}".format(e))
-            notify("Download failed (see debug log).")
+            notify(L('Download failed (see debug log).', 'Stažení selhalo (podrobnosti v logu).'))
             return
     finally:
         resp.close()
 
     content = buf.getvalue()
     if not content:
-        notify("Download failed - empty response (see debug log).")
+        notify(L('Download failed - empty response (see debug log).', 'Stažení selhalo - prázdná odpověď (podrobnosti v logu).'))
         return
 
     # The API always returns a ZIP (Content-Type: application/zip) - a
@@ -650,7 +666,7 @@ def handle_download(params):
     # rejected outright rather than guessed-at and saved as a .srt,
     # which could silently hand Kodi garbage as a "subtitle".
     if not zipfile.is_zipfile(io.BytesIO(content)):
-        notify("Download failed - response wasn't a valid subtitle archive (see debug log).")
+        notify(L("Download failed - response wasn't a valid subtitle archive (see debug log).", 'Stažení selhalo - odpověď nebyl platný archiv s titulky (podrobnosti v logu).'))
         log("downloaded body isn't a valid zip (first bytes: {0!r})".format(content[:16]))
         return
 
@@ -661,7 +677,7 @@ def handle_download(params):
             f.write(content)
     except Exception as e:
         log("failed to write zip file: {0}".format(e))
-        notify("Downloaded but couldn't save the file (see debug log).")
+        notify(L("Downloaded but couldn't save the file (see debug log).", 'Staženo, ale soubor se nepodařilo uložit (podrobnosti v logu).'))
         return
 
     extract_dir = os.path.join(TEMP_DIR, "hanabi_{0}_{1}".format(safe_name, int(time.time())))
@@ -671,18 +687,18 @@ def handle_download(params):
             # extracting, not just the compressed download size.
             extracted_size = sum(info.file_size for info in zf.infolist())
             if extracted_size > MAX_EXTRACTED_BYTES:
-                notify("Download refused - archive is larger than expected when extracted (see debug log).")
+                notify(L('Download refused - archive is larger than expected when extracted (see debug log).', 'Stažení odmítnuto - archiv by byl po rozbalení příliš velký (podrobnosti v logu).'))
                 log("refusing to extract {0}: extracted size {1} exceeds MAX_EXTRACTED_BYTES {2}".format(
                     zip_path, extracted_size, MAX_EXTRACTED_BYTES))
                 return
             zf.extractall(extract_dir)
     except zipfile.BadZipFile as e:
         log("zip file is corrupt: {0}".format(e))
-        notify("Downloaded file wasn't a valid archive (see debug log).")
+        notify(L("Downloaded file wasn't a valid archive (see debug log).", 'Stažený soubor není platný archiv (podrobnosti v logu).'))
         return
     except Exception as e:
         log("zip extract failed: {0}".format(e))
-        notify("Downloaded a zip but couldn't extract it (see debug log).")
+        notify(L("Downloaded a zip but couldn't extract it (see debug log).", 'ZIP se stáhl, ale nepodařilo se ho rozbalit (podrobnosti v logu).'))
         return
 
     sub_file = None
@@ -694,7 +710,7 @@ def handle_download(params):
         if sub_file:
             break
     if not sub_file:
-        notify("Downloaded and extracted, but no .srt/.ass file found inside.")
+        notify(L('Downloaded and extracted, but no .srt/.ass file found inside.', 'Staženo a rozbaleno, ale uvnitř není žádný soubor .srt/.ass.'))
         log("no subtitle file found after extracting {0}".format(zip_path))
         return
 

@@ -1,0 +1,12 @@
+# Kodi Media Center language file
+# Addon id: service.subtitles.hanabi
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: cs_CZ\n"
+
+msgctxt "#32001"
+msgid "Hanabi.fan access token"
+msgstr "Přístupový token k hanabi.fan"
+
