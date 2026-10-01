@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Hanabi (hanabi.fan) Subtitle Downloader - Kodi subtitle service addon.
+Hanabi (hanabi.fan) Subtitles - Kodi subtitle service addon.
 
-Unlike every other addon in this family, this one talks to a real,
-documented REST API (https://hanabi.fan/wp-json/hanabi/v1) rather than
-scraping HTML - Hanabi's own site owner built and published it (with a
-full API.md spec and real example responses) specifically so third-party
-tools like this addon could integrate without needing to log in through
-the site's own web form (which is protected by Cloudflare Turnstile and
-was, for that reason, never scraped directly by this addon or any other
-in this family).
+Uses Hanabi's official, documented REST API
+(https://hanabi.fan/wp-json/hanabi/v1), which the site publishes so tools
+like this can integrate without logging in through the site's own web
+form. No web page scraping.
 
 Auth: a personal access token, created by the user at Hanabi under
 account settings -> "Pristupovy token", pasted into this addon's
 settings. Sent as `Authorization: Bearer <token>` on every request,
 including the download - never as a URL parameter, never logged.
 
-Endpoints used (see the site's own API.md for the authoritative spec):
+Endpoints used:
   - GET /projects?query=<text>            - search projects by title
                                              (matches original/English
                                              title too); paginated via
@@ -30,41 +26,27 @@ Endpoints used (see the site's own API.md for the authoritative spec):
                                              not password-protected)
 
 A project can have more than one subtitle release per episode (different
-fansub release groups, or different translation versions) - all of them
-are listed rather than picked automatically, the same way WoSir lists
-separate TV/BD releases, since only the person watching knows which
-release their video file actually is. Likewise, since Hanabi's project
-data carries no season field, a search can legitimately match more than
-one project (e.g. a combined project vs. a separate "2nd Season" one) -
-see pick_candidate_projects() below, which surfaces every plausible match
-instead of silently guessing.
+fansub groups or translation versions). All of them are listed rather
+than picked automatically, since only the person watching knows which
+release their video file is. Hanabi's project data has no season field,
+so a search can also match more than one project (e.g. a combined project
+and a separate "2nd Season" one) - see pick_candidate_projects() below.
 
-Per the API doc: a download doesn't get built on request - the API loads
-an already-existing ZIP from its own storage and passes it straight
-through. The often-quoted "~30 seconds" is the API's own worst-case
-timeout for that storage read, not the typical download time; in normal
-operation the server responds immediately and the ZIP downloads at once.
-This addon's own DOWNLOAD_TIMEOUT is set to roughly the same order of
-magnitude as that server-side ceiling, purely so an unusually slow
-storage read isn't cut off client-side. A ZIP is capped at 50MB by the
-API itself, which is also why downloads here are streamed with their own
-size cap rather than trusted blindly (see MAX_DOWNLOAD_BYTES below).
+Downloads: the API serves an already-existing ZIP from storage, normally
+instantly; ~30 s is its worst-case timeout for that storage read, and
+DOWNLOAD_TIMEOUT is sized so a slow read isn't cut off. A ZIP is capped
+at 50 MB by the API, so downloads are streamed with their own size cap
+(MAX_DOWNLOAD_BYTES).
 
-The account (not just this addon) is rate-limited by Hanabi: 60
-requests/minute shared across token verification and the search/listing
-endpoints, and separately 10 ZIP downloads/minute (60/hour, at most 2
-concurrent downloads) - added by the API's own maintainer to keep the
-server from being overloaded. A 429 response carries a `Retry-After`
-header (seconds to wait); see http_get_with_retry() below for how this
-addon handles it.
+Rate limits (per account, set by Hanabi): 60 requests/minute across the
+search/listing endpoints, and 10 ZIP downloads/minute (60/hour, at most 2
+at once). A 429 response carries a `Retry-After` header (seconds); see
+http_get_with_retry() below.
 
-Design choices carried over on purpose from Hiyori/WoSir/Edna/Kamui:
-  - No session/result caching beyond the short-lived per-search rows
-    file - simplicity over performance.
-  - Heavy debug logging via log() - enable Kodi's debug log
-    (Settings -> System -> Logging), reproduce, then grep kodi.log for
-    "[Hanabi]" and paste the lines back for troubleshooting. The token
-    itself is never written to the log.
+No session/result caching beyond the short-lived per-search rows file.
+
+Debugging: enable Kodi's debug log (Settings -> System -> Logging),
+reproduce, then look for "[Hanabi]" lines in kodi.log. The token is never written to the log.
 """
 
 import difflib
@@ -191,8 +173,7 @@ def _write_owners(owners):
 def remember_owner(path):
     """Record which video a delivered subtitle belongs to, so
     cleanup_temp_dir() never deletes it while that video is still loaded
-    (e.g. paused for more than an hour) - suggested by Hanabi's API
-    maintainer."""
+    (e.g. paused for more than an hour)."""
     video = current_video()
     if not video:
         return
@@ -208,8 +189,7 @@ def remember_owner(path):
 
 
 def cleanup_temp_dir():
-    """Sweep old downloads out of TEMP_DIR (they used to accumulate
-    forever). Kept: the small caches managed by their own logic, and every
+    """Sweep old downloads out of TEMP_DIR. Kept: the small caches managed by their own logic, and every
     subtitle belonging to the video Kodi currently has loaded - playing or
     paused - however old it is, so a long pause can't delete a subtitle
     that's still in use."""
@@ -263,7 +243,7 @@ def api_error_message(resp):
     return "HTTP {0}".format(resp.status_code)
 
 
-# ---------------- title/query cleanup (same logic as Hiyori/WoSir/Edna) ----------------
+# ---------------- title/query cleanup ----------------
 
 def clean_release_title(name):
     if not name:
@@ -313,9 +293,8 @@ def extract_season_episode(text):
 
 
 def pick_candidate_projects(query, projects, max_candidates=5):
-    """Score every project against the query (same closest-title logic the
-    old pick_best_project() used, tried against title/original_title/
-    english_title) and return every plausible candidate rather than
+    """Score every project against the query (closest-title match, tried
+    against title/original_title/english_title) and return every plausible candidate rather than
     silently picking one. Hanabi's project data has no season field, so a
     query like "Some Anime 2" can legitimately match both a combined
     project and a separate "2nd Season" project - in that case the user
@@ -662,7 +641,7 @@ def handle_download(params):
 
     # The API always returns a ZIP (Content-Type: application/zip) - a
     # non-ZIP body (an HTML error page, a proxy's own error page, ...) is
-    # rejected outright now rather than guessed-at and saved as a .srt,
+    # rejected outright rather than guessed-at and saved as a .srt,
     # which could silently hand Kodi garbage as a "subtitle".
     if not zipfile.is_zipfile(io.BytesIO(content)):
         notify("Download failed - response wasn't a valid subtitle archive (see debug log).")
